@@ -41,6 +41,10 @@ if (!DISCORD_TOKEN || !process.env.CHANNEL_1_ID || !process.env.CHANNEL_2_ID) {
   process.exit(1);
 }
 
+if (!ROBLOSECURITY) {
+  console.warn('WARNING: ROBLOSECURITY is missing. Group/private games may not show active players.');
+}
+
 const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages]
 });
@@ -100,7 +104,8 @@ function nameFromLink(link) {
 function getRobloxConfig() {
   const headers = {
     'User-Agent':
-      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36'
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36',
+    Accept: 'application/json,text/plain,*/*'
   };
 
   if (
@@ -117,7 +122,7 @@ function getRobloxConfig() {
   };
 }
 
-/* ---------------- WORKING PLAYER FETCHER ---------------- */
+/* ---------------- COOKIE-BASED PLAYER + GAME CHECKER ---------------- */
 async function getPlayers(link) {
   try {
     const match = link.match(/\d+/);
@@ -135,31 +140,50 @@ async function getPlayers(link) {
       );
 
       universeId = uniRes.data?.universeId;
+
+      console.log(`[Roblox] placeId=${extractedId} converted to universeId=${universeId}`);
     } catch (err) {
       console.log(
-        `[Roblox] Universe lookup failed for ${extractedId}. Trying ID directly as universeId.`
+        `[Roblox] Universe lookup failed for ${extractedId}. Trying extracted ID directly as universeId. Reason:`,
+        err?.response?.status || err.message
       );
 
       universeId = extractedId;
     }
 
-    if (universeId) {
-      const gameRes = await axios.get(
-        `https://games.roblox.com/v1/games?universeIds=${universeId}`,
-        config
-      );
+    if (!universeId) {
+      return null;
+    }
 
-      const data = gameRes.data?.data?.[0];
+    const gameRes = await axios.get(
+      `https://games.roblox.com/v1/games?universeIds=${universeId}`,
+      config
+    );
 
-      if (data && data.playing !== undefined) {
-        return {
-          players: Number(data.playing || 0),
-          name: data.name || null,
-          isPlayable: data.isPlayable !== false,
-          universeId: String(data.id || universeId),
-          rootPlaceId: data.rootPlaceId ? String(data.rootPlaceId) : extractedId
-        };
-      }
+    const data = gameRes.data?.data?.[0];
+
+    if (!data) {
+      return null;
+    }
+
+    if (data.isPlayable === false) {
+      return {
+        players: null,
+        name: data.name || null,
+        isPlayable: false,
+        universeId: String(data.id || universeId),
+        rootPlaceId: data.rootPlaceId ? String(data.rootPlaceId) : extractedId
+      };
+    }
+
+    if (data.playing !== undefined) {
+      return {
+        players: Number(data.playing || 0),
+        name: data.name || null,
+        isPlayable: true,
+        universeId: String(data.id || universeId),
+        rootPlaceId: data.rootPlaceId ? String(data.rootPlaceId) : extractedId
+      };
     }
 
     return null;
@@ -197,6 +221,9 @@ function buildEmbed(state, game, playerData) {
   const embed = new EmbedBuilder()
     .setColor(0x2b2d31)
     .setTitle(`🎮 ${gameName}`)
+    .setDescription(
+      `⚠️ **join group**\nyou must join group or you cant access game!\n[Click here to join the Group](${state.groupUrl})`
+    )
     .addFields(
       {
         name: '((•)) active players',
@@ -207,11 +234,6 @@ function buildEmbed(state, game, playerData) {
         name: '🕒 server uptime',
         value: `\`${getUptime(state)}\``,
         inline: true
-      },
-      {
-        name: '⚠️ join group',
-        value: 'you must join group or you cant access game!',
-        inline: false
       }
     )
     .setFooter({ text: 'powered by yeti' });
@@ -228,7 +250,7 @@ function buildNoGamesEmbed(state) {
     .setColor(0xff0000)
     .setTitle('⚠ No working games left')
     .setDescription(
-      `All games for **${state.label}** are dead, banned, deleted, or inaccessible.\n\nAdd more games to \`games.json\` and restart the bot.`
+      `All games for **${state.label}** are banned, deleted, private, or inaccessible.\n\nAdd more games to \`games.json\` and restart the bot.`
     )
     .setFooter({ text: 'powered by yeti' });
 }
@@ -275,7 +297,8 @@ async function moveToNextGame(state) {
   const nextPlayers = await getPlayers(nextGame.link);
 
   if (!nextPlayers || nextPlayers.isPlayable === false) {
-    console.log(`[${state.label}] Next game is also dead: ${nextGame.link}`);
+    console.log(`[${state.label}] Next game is also dead/inaccessible: ${nextGame.link}`);
+    await sleep(1000);
     await moveToNextGame(state);
     return;
   }
@@ -311,14 +334,13 @@ async function updateState(state) {
       `[${state.label}] [check] ${game.link} | players=${playerData?.players ?? 'null'} | playable=${playerData?.isPlayable ?? 'unknown'} | universeId=${playerData?.universeId ?? 'null'}`
     );
 
-    // dead / banned / deleted / private / inaccessible
     if (!playerData || playerData.isPlayable === false) {
-      console.log(`[${state.label}] Game dead or inaccessible: ${game.link}`);
+      console.log(`[${state.label}] Game banned/deleted/private/inaccessible: ${game.link}`);
       await moveToNextGame(state);
       return;
     }
 
-    if (!messageExists(state)) {
+    if (!state.message) {
       state.startTime = Date.now();
 
       await postGame(state, game, playerData);
@@ -341,14 +363,11 @@ async function updateState(state) {
   }
 }
 
-function messageExists(state) {
-  return Boolean(state.message);
-}
-
 client.once('clientReady', async () => {
   console.log(`Logged in as ${client.user.tag}`);
   console.log(`Checking every ${CHECK_INTERVAL_MS / 1000}s.`);
   console.log(`GIF_URL loaded: ${GIF_URL || 'none'}`);
+  console.log(`ROBLOSECURITY loaded: ${ROBLOSECURITY ? 'yes' : 'no'}`);
 
   for (const state of states) {
     if (!state.games.length) {
