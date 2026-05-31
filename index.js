@@ -70,7 +70,8 @@ const states = CHANNEL_CONFIGS.map((config) => ({
   currentIndex: 0,
   startTime: Date.now(),
   exhausted: false,
-  isUpdating: false
+  isUpdating: false,
+  lastPlayerData: null
 }));
 
 function sleep(ms) {
@@ -124,86 +125,110 @@ function getRobloxConfig() {
 
 /* ---------------- COOKIE-BASED PLAYER + GAME CHECKER ---------------- */
 async function getPlayers(link) {
-  for (let attempt = 1; attempt <= 3; attempt++) {
+  try {
+    const match = link.match(/\d+/);
+    if (!match) {
+      return {
+        players: null,
+        name: null,
+        isPlayable: false,
+        confirmedDead: true,
+        reason: 'bad_link',
+        universeId: null,
+        rootPlaceId: null
+      };
+    }
+
+    const extractedId = match[0];
+    const config = getRobloxConfig();
+
+    let universeId = null;
+
     try {
-      const match = link.match(/\d+/);
-      if (!match) return null;
-
-      const extractedId = match[0];
-      const config = getRobloxConfig();
-
-      let universeId = null;
-
-      try {
-        const uniRes = await axios.get(
-          `https://apis.roblox.com/universes/v1/places/${extractedId}/universe`,
-          config
-        );
-
-        universeId = uniRes.data?.universeId;
-
-        console.log(
-          `[Roblox] placeId=${extractedId} converted to universeId=${universeId}`
-        );
-      } catch (err) {
-        console.log(
-          `[Roblox] Universe lookup failed for ${extractedId}. Trying extracted ID directly as universeId. Reason:`,
-          err?.response?.status || err.message
-        );
-
-        universeId = extractedId;
-      }
-
-      if (!universeId) {
-        await sleep(1000);
-        continue;
-      }
-
-      const gameRes = await axios.get(
-        `https://games.roblox.com/v1/games?universeIds=${universeId}`,
+      const uniRes = await axios.get(
+        `https://apis.roblox.com/universes/v1/places/${extractedId}/universe`,
         config
       );
 
-      const data = gameRes.data?.data?.[0];
+      universeId = uniRes.data?.universeId;
 
-      if (!data) {
-        console.log(`[Roblox] No game data for universeId=${universeId}`);
-        await sleep(1000);
-        continue;
-      }
-
-      if (data.isPlayable === false) {
-        return {
-          players: null,
-          name: data.name || null,
-          isPlayable: false,
-          universeId: String(data.id || universeId),
-          rootPlaceId: data.rootPlaceId ? String(data.rootPlaceId) : extractedId
-        };
-      }
-
-      if (data.playing !== undefined) {
-        return {
-          players: Number(data.playing || 0),
-          name: data.name || null,
-          isPlayable: true,
-          universeId: String(data.id || universeId),
-          rootPlaceId: data.rootPlaceId ? String(data.rootPlaceId) : extractedId
-        };
-      }
-
-      await sleep(1000);
+      console.log(
+        `[Roblox] placeId=${extractedId} converted to universeId=${universeId}`
+      );
     } catch (err) {
       console.log(
-        `[Roblox] getPlayers attempt ${attempt}/3 failed:`,
+        `[Roblox] Universe lookup failed for ${extractedId}. Trying extracted ID directly as universeId. Reason:`,
         err?.response?.status || err.message
       );
 
-      await sleep(1000);
+      universeId = extractedId;
     }
-  }
 
-  return null;
+    if (!universeId) {
+      return {
+        players: null,
+        name: null,
+        isPlayable: true,
+        confirmedDead: false,
+        reason: 'no_universe_id',
+        universeId: null,
+        rootPlaceId: extractedId
+      };
+    }
+
+    const gameRes = await axios.get(
+      `https://games.roblox.com/v1/games?universeIds=${universeId}`,
+      config
+    );
+
+    const data = gameRes.data?.data?.[0];
+
+    if (!data) {
+      return {
+        players: null,
+        name: null,
+        isPlayable: true,
+        confirmedDead: false,
+        reason: 'no_game_data',
+        universeId: String(universeId),
+        rootPlaceId: extractedId
+      };
+    }
+
+    if (data.isPlayable === false) {
+      return {
+        players: null,
+        name: data.name || null,
+        isPlayable: false,
+        confirmedDead: true,
+        reason: 'not_playable',
+        universeId: String(data.id || universeId),
+        rootPlaceId: data.rootPlaceId ? String(data.rootPlaceId) : extractedId
+      };
+    }
+
+    return {
+      players: Number(data.playing || 0),
+      name: data.name || null,
+      isPlayable: true,
+      confirmedDead: false,
+      reason: 'online',
+      universeId: String(data.id || universeId),
+      rootPlaceId: data.rootPlaceId ? String(data.rootPlaceId) : extractedId
+    };
+  } catch (err) {
+    console.log('[Roblox] getPlayers error:', err?.response?.status || err.message);
+
+    return {
+      players: null,
+      name: null,
+      isPlayable: true,
+      confirmedDead: false,
+      reason: err?.response?.status ? `api_error_${err.response.status}` : 'api_error',
+      universeId: null,
+      rootPlaceId: null
+    };
+  }
 }
 
 function buildButtons(state, game) {
@@ -221,13 +246,15 @@ function buildButtons(state, game) {
 }
 
 function buildEmbed(state, game, playerData) {
+  const usableData = playerData || state.lastPlayerData;
+
   const players =
-    playerData && playerData.players !== null && playerData.players !== undefined
-      ? playerData.players
+    usableData && usableData.players !== null && usableData.players !== undefined
+      ? usableData.players
       : 'N/A';
 
   const gameName =
-    playerData?.name ||
+    usableData?.name ||
     game.name ||
     nameFromLink(game.link);
 
@@ -263,12 +290,16 @@ function buildNoGamesEmbed(state) {
     .setColor(0xff0000)
     .setTitle('⚠ No working games left')
     .setDescription(
-      `All games for **${state.label}** are banned, deleted, private, or inaccessible.\n\nAdd more games to \`games.json\` and restart the bot.`
+      `All games for **${state.label}** are confirmed banned or unplayable.\n\nAdd more games to \`games.json\` and restart the bot.`
     )
     .setFooter({ text: 'powered by yeti' });
 }
 
 async function postGame(state, game, playerData) {
+  if (playerData && playerData.players !== null && playerData.players !== undefined) {
+    state.lastPlayerData = playerData;
+  }
+
   state.message = await state.channel.send({
     embeds: [buildEmbed(state, game, playerData)],
     components: [buildButtons(state, game)]
@@ -289,38 +320,47 @@ async function stopChannel(state) {
 }
 
 async function moveToNextGame(state) {
-  console.log(`[${state.label}] Moving to next game.`);
+  console.log(`[${state.label}] Looking for next confirmed working game.`);
 
   if (state.message) {
     await state.message.delete().catch(() => {});
     state.message = null;
   }
 
-  state.currentIndex += 1;
+  while (state.currentIndex + 1 < state.games.length) {
+    state.currentIndex += 1;
+    state.startTime = Date.now();
+    state.lastPlayerData = null;
 
-  if (state.currentIndex >= state.games.length) {
-    console.log(`[${state.label}] Reached end of games list.`);
-    await stopChannel(state);
+    const nextGame = state.games[state.currentIndex];
+
+    console.log(
+      `[${state.label}] Testing game ${state.currentIndex + 1}/${state.games.length}: ${nextGame.link}`
+    );
+
+    const nextPlayers = await getPlayers(nextGame.link);
+
+    console.log(
+      `[${state.label}] Test result | players=${nextPlayers?.players ?? 'null'} | playable=${nextPlayers?.isPlayable ?? 'unknown'} | confirmedDead=${nextPlayers?.confirmedDead ?? 'unknown'} | reason=${nextPlayers?.reason ?? 'unknown'} | universeId=${nextPlayers?.universeId ?? 'null'}`
+    );
+
+    if (nextPlayers?.confirmedDead === true) {
+      console.log(`[${state.label}] Skipping confirmed dead game: ${nextGame.link}`);
+      await sleep(1000);
+      continue;
+    }
+
+    await postGame(state, nextGame, nextPlayers);
+
+    console.log(
+      `[${state.label}] Posted next game ${state.currentIndex + 1}/${state.games.length}: ${nextGame.link}`
+    );
+
     return;
   }
 
-  state.startTime = Date.now();
-
-  const nextGame = state.games[state.currentIndex];
-  const nextPlayers = await getPlayers(nextGame.link);
-
-  if (!nextPlayers || nextPlayers.isPlayable === false) {
-    console.log(`[${state.label}] Next game is also dead/inaccessible: ${nextGame.link}`);
-    await sleep(1000);
-    await moveToNextGame(state);
-    return;
-  }
-
-  await postGame(state, nextGame, nextPlayers);
-
-  console.log(
-    `[${state.label}] Posted next game ${state.currentIndex + 1}/${state.games.length}: ${nextGame.link}`
-  );
+  console.log(`[${state.label}] No confirmed working games left.`);
+  await stopChannel(state);
 }
 
 async function updateState(state) {
@@ -344,13 +384,19 @@ async function updateState(state) {
     const playerData = await getPlayers(game.link);
 
     console.log(
-      `[${state.label}] [check] ${game.link} | players=${playerData?.players ?? 'null'} | playable=${playerData?.isPlayable ?? 'unknown'} | universeId=${playerData?.universeId ?? 'null'}`
+      `[${state.label}] [check] ${game.link} | players=${playerData?.players ?? 'null'} | playable=${playerData?.isPlayable ?? 'unknown'} | confirmedDead=${playerData?.confirmedDead ?? 'unknown'} | reason=${playerData?.reason ?? 'unknown'} | universeId=${playerData?.universeId ?? 'null'}`
     );
 
-    if (!playerData || playerData.isPlayable === false) {
-      console.log(`[${state.label}] Game banned/deleted/private/inaccessible: ${game.link}`);
+    // ONLY switch games when Roblox clearly says the game is not playable.
+    // Do NOT switch just because active players could not be read.
+    if (playerData?.confirmedDead === true) {
+      console.log(`[${state.label}] Game confirmed banned/unplayable: ${game.link}`);
       await moveToNextGame(state);
       return;
+    }
+
+    if (playerData && playerData.players !== null && playerData.players !== undefined) {
+      state.lastPlayerData = playerData;
     }
 
     if (!state.message) {
