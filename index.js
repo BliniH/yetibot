@@ -209,22 +209,13 @@ function cleanNumber(value) {
 }
 
 async function getUniverseFromPlace(placeId) {
-  const modernData = await fetchJson(
+  const data = await fetchJson(
     `https://apis.roblox.com/universes/v1/places/${placeId}/universe`,
-    `modern universe lookup ${placeId}`
+    `place -> universe lookup ${placeId}`
   );
 
-  if (modernData?.universeId) {
-    return String(modernData.universeId);
-  }
-
-  const legacyData = await fetchJson(
-    `https://api.roblox.com/universes/get-universe-containing-place?placeid=${placeId}`,
-    `legacy universe lookup ${placeId}`
-  );
-
-  if (legacyData?.UniverseId) {
-    return String(legacyData.UniverseId);
+  if (data?.universeId) {
+    return String(data.universeId);
   }
 
   return null;
@@ -233,11 +224,14 @@ async function getUniverseFromPlace(placeId) {
 async function getGameByUniverse(universeId) {
   const data = await fetchJson(
     `https://games.roblox.com/v1/games?universeIds=${universeId}`,
-    `game lookup universe ${universeId}`
+    `universe game stats ${universeId}`
   );
 
   const game = data?.data?.[0];
-  if (!game) return null;
+
+  if (!game) {
+    return null;
+  }
 
   return {
     ok: game.isPlayable !== false,
@@ -248,36 +242,6 @@ async function getGameByUniverse(universeId) {
     rootPlaceId: game.rootPlaceId ? String(game.rootPlaceId) : null,
     universeId: String(game.id || universeId)
   };
-}
-
-async function getPlaceDetails(placeId) {
-  const endpoints = [
-    `https://games.roblox.com/v1/games/multiget-place-details?placeIds=${placeId}`,
-    `https://www.roblox.com/games/multiget-place-details?placeIds=${placeId}`
-  ];
-
-  for (const url of endpoints) {
-    const data = await fetchJson(url, `place details ${placeId}`);
-    const detail = Array.isArray(data) ? data[0] : null;
-
-    if (!detail) continue;
-
-    return {
-      ok: detail.isPlayable !== false,
-      reason:
-        detail.isPlayable === false
-          ? 'not_playable_place_details'
-          : 'online_place_details',
-      name: detail.name || detail.Name || null,
-      players: cleanNumber(
-        detail.playerCount ?? detail.PlayerCount ?? detail.playing
-      ),
-      placeId: String(detail.placeId || detail.PlaceId || placeId),
-      universeId: detail.universeId ? String(detail.universeId) : null
-    };
-  }
-
-  return null;
 }
 
 async function getGameStatus(game) {
@@ -294,58 +258,37 @@ async function getGameStatus(game) {
     };
   }
 
-  // IMPORTANT:
-  // First convert placeId -> universeId, then use games API.
-  // This gives the real "playing" count much more reliably.
   const universeId = await getUniverseFromPlace(placeId);
 
-  if (universeId) {
-    const byUniverse = await getGameByUniverse(universeId);
-
-    if (byUniverse) {
-      return {
-        ...byUniverse,
-        name: game.name || byUniverse.name || nameFromLink(game.link),
-        placeId: byUniverse.rootPlaceId || placeId,
-        universeId
-      };
-    }
-  }
-
-  // Backup: sometimes the ID behaves like universe ID.
-  const directUniverse = await getGameByUniverse(placeId);
-
-  if (directUniverse) {
+  if (!universeId) {
     return {
-      ...directUniverse,
-      reason: directUniverse.ok
-        ? 'online_direct_universe'
-        : directUniverse.reason,
-      name: game.name || directUniverse.name || nameFromLink(game.link),
-      placeId: directUniverse.rootPlaceId || placeId,
-      universeId: placeId
+      ok: false,
+      reason: 'no_universe_id',
+      players: null,
+      name: game.name || nameFromLink(game.link),
+      placeId,
+      universeId: null
     };
   }
 
-  // Final backup: place details.
-  const details = await getPlaceDetails(placeId);
+  const byUniverse = await getGameByUniverse(universeId);
 
-  if (details) {
+  if (!byUniverse) {
     return {
-      ...details,
-      name: game.name || details.name || nameFromLink(game.link),
-      placeId: details.placeId || placeId,
-      universeId: details.universeId || universeId
+      ok: false,
+      reason: 'no_game_data',
+      players: null,
+      name: game.name || nameFromLink(game.link),
+      placeId,
+      universeId
     };
   }
 
   return {
-    ok: false,
-    reason: 'no_api_data',
-    players: null,
-    name: game.name || nameFromLink(game.link),
-    placeId,
-    universeId: universeId || null
+    ...byUniverse,
+    name: game.name || byUniverse.name || nameFromLink(game.link),
+    placeId: byUniverse.rootPlaceId || placeId,
+    universeId
   };
 }
 
@@ -531,7 +474,7 @@ async function updateState(state) {
     const key = game.link;
 
     console.log(
-      `[${state.label}] [check] ${status.name} | ok=${status.ok} | players=${status.players} | reason=${status.reason}`
+      `[${state.label}] [check] ${status.name} | placeId=${status.placeId} | universeId=${status.universeId} | ok=${status.ok} | players=${status.players} | reason=${status.reason}`
     );
 
     if (status.players !== null && status.players !== undefined) {
