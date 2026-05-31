@@ -14,6 +14,7 @@ const {
 
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
 const CHECK_INTERVAL_MS = Number(process.env.CHECK_INTERVAL_MS || 30000);
+const FAILS_BEFORE_SWITCH = Number(process.env.FAILS_BEFORE_SWITCH || 3);
 const GIF_URL = (process.env.GIF_URL || '').trim().replace(/^["']|["']$/g, '');
 const ROBLOSECURITY = (process.env.ROBLOSECURITY || '').trim();
 
@@ -71,7 +72,8 @@ const states = CHANNEL_CONFIGS.map((config) => ({
   startTime: Date.now(),
   exhausted: false,
   isUpdating: false,
-  lastPlayerData: null
+  lastPlayerData: null,
+  failCounts: new Map()
 }));
 
 function sleep(ms) {
@@ -119,8 +121,23 @@ function getRobloxConfig() {
 
   return {
     headers,
-    timeout: 15000
+    timeout: 15000,
+    validateStatus: (status) => status >= 200 && status < 500
   };
+}
+
+function getFailCount(state, link) {
+  return state.failCounts.get(link) || 0;
+}
+
+function addFail(state, link) {
+  const fails = getFailCount(state, link) + 1;
+  state.failCounts.set(link, fails);
+  return fails;
+}
+
+function clearFail(state, link) {
+  state.failCounts.set(link, 0);
 }
 
 /* ---------------- COOKIE-BASED PLAYER + GAME CHECKER ---------------- */
@@ -133,6 +150,7 @@ async function getPlayers(link) {
         name: null,
         isPlayable: false,
         confirmedDead: true,
+        suspicious: true,
         reason: 'bad_link',
         universeId: null,
         rootPlaceId: null
@@ -144,32 +162,37 @@ async function getPlayers(link) {
 
     let universeId = null;
 
-    try {
-      const uniRes = await axios.get(
-        `https://apis.roblox.com/universes/v1/places/${extractedId}/universe`,
-        config
-      );
+    const uniRes = await axios.get(
+      `https://apis.roblox.com/universes/v1/places/${extractedId}/universe`,
+      config
+    );
 
-      universeId = uniRes.data?.universeId;
+    if (uniRes.status >= 400) {
+      console.log(`[Roblox] Universe lookup HTTP ${uniRes.status} for placeId=${extractedId}`);
 
-      console.log(
-        `[Roblox] placeId=${extractedId} converted to universeId=${universeId}`
-      );
-    } catch (err) {
-      console.log(
-        `[Roblox] Universe lookup failed for ${extractedId}. Trying extracted ID directly as universeId. Reason:`,
-        err?.response?.status || err.message
-      );
-
-      universeId = extractedId;
+      return {
+        players: null,
+        name: nameFromLink(link),
+        isPlayable: true,
+        confirmedDead: false,
+        suspicious: true,
+        reason: `universe_lookup_${uniRes.status}`,
+        universeId: null,
+        rootPlaceId: extractedId
+      };
     }
+
+    universeId = uniRes.data?.universeId;
+
+    console.log(`[Roblox] placeId=${extractedId} converted to universeId=${universeId}`);
 
     if (!universeId) {
       return {
         players: null,
-        name: null,
+        name: nameFromLink(link),
         isPlayable: true,
         confirmedDead: false,
+        suspicious: true,
         reason: 'no_universe_id',
         universeId: null,
         rootPlaceId: extractedId
@@ -181,14 +204,30 @@ async function getPlayers(link) {
       config
     );
 
+    if (gameRes.status >= 400) {
+      console.log(`[Roblox] Game lookup HTTP ${gameRes.status} for universeId=${universeId}`);
+
+      return {
+        players: null,
+        name: nameFromLink(link),
+        isPlayable: true,
+        confirmedDead: false,
+        suspicious: true,
+        reason: `game_lookup_${gameRes.status}`,
+        universeId: String(universeId),
+        rootPlaceId: extractedId
+      };
+    }
+
     const data = gameRes.data?.data?.[0];
 
     if (!data) {
       return {
         players: null,
-        name: null,
+        name: nameFromLink(link),
         isPlayable: true,
         confirmedDead: false,
+        suspicious: true,
         reason: 'no_game_data',
         universeId: String(universeId),
         rootPlaceId: extractedId
@@ -198,9 +237,10 @@ async function getPlayers(link) {
     if (data.isPlayable === false) {
       return {
         players: null,
-        name: data.name || null,
+        name: data.name || nameFromLink(link),
         isPlayable: false,
         confirmedDead: true,
+        suspicious: true,
         reason: 'not_playable',
         universeId: String(data.id || universeId),
         rootPlaceId: data.rootPlaceId ? String(data.rootPlaceId) : extractedId
@@ -209,9 +249,10 @@ async function getPlayers(link) {
 
     return {
       players: Number(data.playing || 0),
-      name: data.name || null,
+      name: data.name || nameFromLink(link),
       isPlayable: true,
       confirmedDead: false,
+      suspicious: false,
       reason: 'online',
       universeId: String(data.id || universeId),
       rootPlaceId: data.rootPlaceId ? String(data.rootPlaceId) : extractedId
@@ -221,9 +262,10 @@ async function getPlayers(link) {
 
     return {
       players: null,
-      name: null,
+      name: nameFromLink(link),
       isPlayable: true,
       confirmedDead: false,
+      suspicious: true,
       reason: err?.response?.status ? `api_error_${err.response.status}` : 'api_error',
       universeId: null,
       rootPlaceId: null
@@ -290,7 +332,7 @@ function buildNoGamesEmbed(state) {
     .setColor(0xff0000)
     .setTitle('⚠ No working games left')
     .setDescription(
-      `All games for **${state.label}** are confirmed banned or unplayable.\n\nAdd more games to \`games.json\` and restart the bot.`
+      `All games for **${state.label}** are confirmed banned, deleted, or unreachable after repeated checks.\n\nAdd more games to \`games.json\` and restart the bot.`
     )
     .setFooter({ text: 'powered by yeti' });
 }
@@ -320,7 +362,7 @@ async function stopChannel(state) {
 }
 
 async function moveToNextGame(state) {
-  console.log(`[${state.label}] Looking for next confirmed working game.`);
+  console.log(`[${state.label}] Looking for next working game.`);
 
   if (state.message) {
     await state.message.delete().catch(() => {});
@@ -338,28 +380,46 @@ async function moveToNextGame(state) {
       `[${state.label}] Testing game ${state.currentIndex + 1}/${state.games.length}: ${nextGame.link}`
     );
 
-    const nextPlayers = await getPlayers(nextGame.link);
+    let nextPlayers = null;
 
-    console.log(
-      `[${state.label}] Test result | players=${nextPlayers?.players ?? 'null'} | playable=${nextPlayers?.isPlayable ?? 'unknown'} | confirmedDead=${nextPlayers?.confirmedDead ?? 'unknown'} | reason=${nextPlayers?.reason ?? 'unknown'} | universeId=${nextPlayers?.universeId ?? 'null'}`
-    );
+    for (let attempt = 1; attempt <= FAILS_BEFORE_SWITCH; attempt++) {
+      nextPlayers = await getPlayers(nextGame.link);
+
+      console.log(
+        `[${state.label}] Test ${attempt}/${FAILS_BEFORE_SWITCH} | players=${nextPlayers?.players ?? 'null'} | playable=${nextPlayers?.isPlayable ?? 'unknown'} | confirmedDead=${nextPlayers?.confirmedDead ?? 'unknown'} | suspicious=${nextPlayers?.suspicious ?? 'unknown'} | reason=${nextPlayers?.reason ?? 'unknown'} | universeId=${nextPlayers?.universeId ?? 'null'}`
+      );
+
+      if (nextPlayers?.confirmedDead === true) {
+        break;
+      }
+
+      if (nextPlayers?.suspicious === false) {
+        break;
+      }
+
+      await sleep(1000);
+    }
 
     if (nextPlayers?.confirmedDead === true) {
       console.log(`[${state.label}] Skipping confirmed dead game: ${nextGame.link}`);
-      await sleep(1000);
+      continue;
+    }
+
+    if (nextPlayers?.suspicious === true) {
+      console.log(`[${state.label}] Skipping unreachable/suspicious game after repeated checks: ${nextGame.link}`);
       continue;
     }
 
     await postGame(state, nextGame, nextPlayers);
 
     console.log(
-      `[${state.label}] Posted next game ${state.currentIndex + 1}/${state.games.length}: ${nextGame.link}`
+      `[${state.label}] Posted next working game ${state.currentIndex + 1}/${state.games.length}: ${nextGame.link}`
     );
 
     return;
   }
 
-  console.log(`[${state.label}] No confirmed working games left.`);
+  console.log(`[${state.label}] No working games left.`);
   await stopChannel(state);
 }
 
@@ -384,16 +444,41 @@ async function updateState(state) {
     const playerData = await getPlayers(game.link);
 
     console.log(
-      `[${state.label}] [check] ${game.link} | players=${playerData?.players ?? 'null'} | playable=${playerData?.isPlayable ?? 'unknown'} | confirmedDead=${playerData?.confirmedDead ?? 'unknown'} | reason=${playerData?.reason ?? 'unknown'} | universeId=${playerData?.universeId ?? 'null'}`
+      `[${state.label}] [check] ${game.link} | players=${playerData?.players ?? 'null'} | playable=${playerData?.isPlayable ?? 'unknown'} | confirmedDead=${playerData?.confirmedDead ?? 'unknown'} | suspicious=${playerData?.suspicious ?? 'unknown'} | reason=${playerData?.reason ?? 'unknown'} | universeId=${playerData?.universeId ?? 'null'}`
     );
 
-    // ONLY switch games when Roblox clearly says the game is not playable.
-    // Do NOT switch just because active players could not be read.
     if (playerData?.confirmedDead === true) {
       console.log(`[${state.label}] Game confirmed banned/unplayable: ${game.link}`);
       await moveToNextGame(state);
       return;
     }
+
+    if (playerData?.suspicious === true) {
+      const fails = addFail(state, game.link);
+
+      console.log(
+        `[${state.label}] Suspicious check count: ${fails}/${FAILS_BEFORE_SWITCH}`
+      );
+
+      if (fails >= FAILS_BEFORE_SWITCH) {
+        console.log(`[${state.label}] Game failed repeated checks. Moving next: ${game.link}`);
+        await moveToNextGame(state);
+        return;
+      }
+
+      if (!state.message) {
+        await postGame(state, game, playerData);
+      } else {
+        await state.message.edit({
+          embeds: [buildEmbed(state, game, playerData)],
+          components: [buildButtons(state, game)]
+        });
+      }
+
+      return;
+    }
+
+    clearFail(state, game.link);
 
     if (playerData && playerData.players !== null && playerData.players !== undefined) {
       state.lastPlayerData = playerData;
@@ -425,6 +510,7 @@ async function updateState(state) {
 client.once('clientReady', async () => {
   console.log(`Logged in as ${client.user.tag}`);
   console.log(`Checking every ${CHECK_INTERVAL_MS / 1000}s.`);
+  console.log(`Fails before switch: ${FAILS_BEFORE_SWITCH}`);
   console.log(`GIF_URL loaded: ${GIF_URL || 'none'}`);
   console.log(`ROBLOSECURITY loaded: ${ROBLOSECURITY ? 'yes' : 'no'}`);
 
