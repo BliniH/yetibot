@@ -16,7 +16,7 @@ const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
 const CHECK_INTERVAL_MS = Number(process.env.CHECK_INTERVAL_MS || 30000);
 const FAILS_BEFORE_SWITCH = Number(process.env.FAILS_BEFORE_SWITCH || 3);
 const GIF_URL = (process.env.GIF_URL || '').trim().replace(/^["']|["']$/g, '');
-const ROBLOSECURITY = process.env.ROBLOSECURITY || '';
+const ROBLOSECURITY = (process.env.ROBLOSECURITY || '').trim();
 
 const CHANNEL_CONFIGS = [
   {
@@ -38,7 +38,7 @@ const CHANNEL_CONFIGS = [
 ];
 
 if (!DISCORD_TOKEN || !process.env.CHANNEL_1_ID || !process.env.CHANNEL_2_ID) {
-  console.error('Missing DISCORD_TOKEN, CHANNEL_1_ID, or CHANNEL_2_ID in .env');
+  console.error('Missing DISCORD_TOKEN, CHANNEL_1_ID, or CHANNEL_2_ID in .env / Railway variables');
   process.exit(1);
 }
 
@@ -68,9 +68,10 @@ const states = CHANNEL_CONFIGS.map((config) => ({
   startTime: Date.now(),
   failCounts: new Map(),
   lastGoodPlayers: null,
+  exhausted: false,
 
-  // NEW: stops the channel once every game has failed
-  exhausted: false
+  // prevents Railway/Node from overlapping checks
+  isUpdating: false
 }));
 
 function robloxHeaders() {
@@ -124,6 +125,14 @@ function getUptime(state) {
   return `${m}m ${s}s`;
 }
 
+function shouldSwitchGame(status) {
+  return [
+    'not_playable',
+    'not_playable_place_details',
+    'bad_link'
+  ].includes(status.reason);
+}
+
 async function getUniverseFromPlace(placeId) {
   try {
     const res = await axios.get(
@@ -136,6 +145,7 @@ async function getUniverseFromPlace(placeId) {
 
     return res.data?.universeId ? String(res.data.universeId) : null;
   } catch (err) {
+    console.log(`[Roblox] universe lookup failed for place ${placeId}:`, err?.response?.status || err.message);
     return null;
   }
 }
@@ -163,6 +173,7 @@ async function getGameByUniverse(universeId) {
       universeId: String(data.id || universeId)
     };
   } catch (err) {
+    console.log(`[Roblox] game lookup failed for universe ${universeId}:`, err?.response?.status || err.message);
     return null;
   }
 }
@@ -197,7 +208,7 @@ async function getPlaceDetails(placeId) {
         universeId: data.universeId ? String(data.universeId) : null
       };
     } catch (err) {
-      // try next endpoint
+      console.log(`[Roblox] place details failed for ${placeId}:`, err?.response?.status || err.message);
     }
   }
 
@@ -259,6 +270,9 @@ async function getGameStatus(game) {
     };
   }
 
+  // IMPORTANT:
+  // This does NOT always mean banned/deleted.
+  // It can just mean Roblox API failed, rate limited, or returned nothing.
   return {
     ok: false,
     reason: 'no_api_data',
@@ -286,10 +300,18 @@ function buildButtons(state, game) {
 function buildEmbed(state, game, status) {
   const playersText =
     status.players === null || status.players === undefined
-      ? 'checking...'
+      ? state.lastGoodPlayers !== null
+        ? `${state.lastGoodPlayers}`
+        : 'checking...'
       : String(status.players);
 
-  const statusText = status.ok ? 'ONLINE' : `CHECKING (${status.reason})`;
+  let statusText = 'ONLINE';
+
+  if (!status.ok && status.reason === 'no_api_data') {
+    statusText = 'CHECKING API';
+  } else if (!status.ok) {
+    statusText = `CHECKING (${status.reason})`;
+  }
 
   const embed = new EmbedBuilder()
     .setColor(status.ok ? 0x6a00ff : 0xffb000)
@@ -326,9 +348,9 @@ function buildEmbed(state, game, status) {
 function buildNoGamesEmbed(state, reason) {
   return new EmbedBuilder()
     .setColor(0xff0000)
-    .setTitle(`⚠ No working games left`)
+    .setTitle('⚠ No working games left')
     .setDescription(
-      `All games for **${state.label}** have failed checks.\n\nLast reason: \`${reason}\`\n\nAdd more games to \`games.json\` and restart the bot.`
+      `All games for **${state.label}** have failed real checks.\n\nLast reason: \`${reason}\`\n\nAdd more games to \`games.json\` and restart the bot.`
     )
     .setFooter({ text: 'powered by yeti' });
 }
@@ -393,9 +415,6 @@ async function switchToNextGame(state, reason) {
 
   state.currentIndex += 1;
 
-  // FIXED:
-  // Old code looped back to 0 here.
-  // New code stops this channel when the final game also fails.
   if (state.currentIndex >= state.games.length) {
     await stopChannelBecauseNoGamesLeft(state, reason);
     return;
@@ -408,13 +427,18 @@ async function switchToNextGame(state, reason) {
 }
 
 async function updateState(state) {
+  if (state.isUpdating) {
+    console.log(`[${state.label}] Skipping check because previous check is still running.`);
+    return;
+  }
+
+  state.isUpdating = true;
+
   try {
     if (!state.games.length) return;
 
-    // NEW: once all games failed, stop checking/posting this channel
     if (state.exhausted) return;
 
-    // NEW: extra protection so it never reads past the games list
     if (state.currentIndex >= state.games.length) {
       await stopChannelBecauseNoGamesLeft(state, 'index_out_of_range');
       return;
@@ -440,19 +464,28 @@ async function updateState(state) {
     );
 
     if (!status.ok) {
-      const fails = (state.failCounts.get(key) || 0) + 1;
-      state.failCounts.set(key, fails);
-
-      console.log(
-        `[${state.label}] Fail count: ${fails}/${FAILS_BEFORE_SWITCH}`
-      );
-
       await state.message
         .edit({
           embeds: [buildEmbed(state, game, status)],
           components: [buildButtons(state, game)]
         })
         .catch(() => {});
+
+      // BIG FIX:
+      // Do NOT switch games when Roblox API just gives no data.
+      if (!shouldSwitchGame(status)) {
+        console.log(
+          `[${state.label}] Not switching. Reason "${status.reason}" is API/check issue, not confirmed game dead.`
+        );
+        return;
+      }
+
+      const fails = (state.failCounts.get(key) || 0) + 1;
+      state.failCounts.set(key, fails);
+
+      console.log(
+        `[${state.label}] Real fail count: ${fails}/${FAILS_BEFORE_SWITCH}`
+      );
 
       if (fails >= FAILS_BEFORE_SWITCH) {
         await switchToNextGame(state, status.reason);
@@ -473,6 +506,8 @@ async function updateState(state) {
       `[${state.label}] UPDATE ERROR:`,
       err?.response?.data || err.message
     );
+  } finally {
+    state.isUpdating = false;
   }
 }
 
@@ -481,6 +516,7 @@ client.once('clientReady', async () => {
   console.log(
     `Checking every ${CHECK_INTERVAL_MS / 1000}s. Fails before switch: ${FAILS_BEFORE_SWITCH}.`
   );
+  console.log(`GIF_URL loaded: ${GIF_URL || 'none'}`);
 
   for (const state of states) {
     if (!state.games.length) {
