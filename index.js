@@ -124,73 +124,86 @@ function getRobloxConfig() {
 
 /* ---------------- COOKIE-BASED PLAYER + GAME CHECKER ---------------- */
 async function getPlayers(link) {
-  try {
-    const match = link.match(/\d+/);
-    if (!match) return null;
-
-    const extractedId = match[0];
-    const config = getRobloxConfig();
-
-    let universeId = null;
-
+  for (let attempt = 1; attempt <= 3; attempt++) {
     try {
-      const uniRes = await axios.get(
-        `https://apis.roblox.com/universes/v1/places/${extractedId}/universe`,
+      const match = link.match(/\d+/);
+      if (!match) return null;
+
+      const extractedId = match[0];
+      const config = getRobloxConfig();
+
+      let universeId = null;
+
+      try {
+        const uniRes = await axios.get(
+          `https://apis.roblox.com/universes/v1/places/${extractedId}/universe`,
+          config
+        );
+
+        universeId = uniRes.data?.universeId;
+
+        console.log(
+          `[Roblox] placeId=${extractedId} converted to universeId=${universeId}`
+        );
+      } catch (err) {
+        console.log(
+          `[Roblox] Universe lookup failed for ${extractedId}. Trying extracted ID directly as universeId. Reason:`,
+          err?.response?.status || err.message
+        );
+
+        universeId = extractedId;
+      }
+
+      if (!universeId) {
+        await sleep(1000);
+        continue;
+      }
+
+      const gameRes = await axios.get(
+        `https://games.roblox.com/v1/games?universeIds=${universeId}`,
         config
       );
 
-      universeId = uniRes.data?.universeId;
+      const data = gameRes.data?.data?.[0];
 
-      console.log(`[Roblox] placeId=${extractedId} converted to universeId=${universeId}`);
+      if (!data) {
+        console.log(`[Roblox] No game data for universeId=${universeId}`);
+        await sleep(1000);
+        continue;
+      }
+
+      if (data.isPlayable === false) {
+        return {
+          players: null,
+          name: data.name || null,
+          isPlayable: false,
+          universeId: String(data.id || universeId),
+          rootPlaceId: data.rootPlaceId ? String(data.rootPlaceId) : extractedId
+        };
+      }
+
+      if (data.playing !== undefined) {
+        return {
+          players: Number(data.playing || 0),
+          name: data.name || null,
+          isPlayable: true,
+          universeId: String(data.id || universeId),
+          rootPlaceId: data.rootPlaceId ? String(data.rootPlaceId) : extractedId
+        };
+      }
+
+      await sleep(1000);
     } catch (err) {
       console.log(
-        `[Roblox] Universe lookup failed for ${extractedId}. Trying extracted ID directly as universeId. Reason:`,
+        `[Roblox] getPlayers attempt ${attempt}/3 failed:`,
         err?.response?.status || err.message
       );
 
-      universeId = extractedId;
+      await sleep(1000);
     }
-
-    if (!universeId) {
-      return null;
-    }
-
-    const gameRes = await axios.get(
-      `https://games.roblox.com/v1/games?universeIds=${universeId}`,
-      config
-    );
-
-    const data = gameRes.data?.data?.[0];
-
-    if (!data) {
-      return null;
-    }
-
-    if (data.isPlayable === false) {
-      return {
-        players: null,
-        name: data.name || null,
-        isPlayable: false,
-        universeId: String(data.id || universeId),
-        rootPlaceId: data.rootPlaceId ? String(data.rootPlaceId) : extractedId
-      };
-    }
-
-    if (data.playing !== undefined) {
-      return {
-        players: Number(data.playing || 0),
-        name: data.name || null,
-        isPlayable: true,
-        universeId: String(data.id || universeId),
-        rootPlaceId: data.rootPlaceId ? String(data.rootPlaceId) : extractedId
-      };
-    }
-
-    return null;
-  } catch (err) {
-    console.log('[Roblox] getPlayers error:', err?.response?.status || err.message);
-    return null;
   }
+
+  return null;
 }
 
 function buildButtons(state, game) {
