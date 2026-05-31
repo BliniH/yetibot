@@ -9,14 +9,15 @@ const {
   EmbedBuilder,
   ActionRowBuilder,
   ButtonBuilder,
-  ButtonStyle
+  ButtonStyle,
+  AttachmentBuilder
 } = require('discord.js');
 
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
 const CHECK_INTERVAL_MS = Number(process.env.CHECK_INTERVAL_MS || 30000);
 const FAILS_BEFORE_SWITCH = Number(process.env.FAILS_BEFORE_SWITCH || 3);
 
-const GIF_URL = (process.env.GIF_URL || process.env.IMAGE_URL || '')
+const GIF_URL = (process.env.GIF_URL || '')
   .trim()
   .replace(/^["']|["']$/g, '');
 
@@ -50,6 +51,9 @@ const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages]
 });
 
+let cachedGifBuffer = null;
+let gifDownloadFailed = false;
+
 function normalizeGames(raw) {
   return raw
     .map((item) => (typeof item === 'string' ? { link: item } : item))
@@ -73,7 +77,8 @@ const states = CHANNEL_CONFIGS.map((config) => ({
   failCounts: new Map(),
   lastGoodPlayers: null,
   exhausted: false,
-  isUpdating: false
+  isUpdating: false,
+  hasGifAttachment: false
 }));
 
 function robloxHeaders() {
@@ -96,8 +101,44 @@ function robloxHeaders() {
   return headers;
 }
 
+function imageHeaders() {
+  return {
+    'User-Agent':
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36',
+    Accept: 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8'
+  };
+}
+
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function getGifAttachment() {
+  if (!GIF_URL || gifDownloadFailed) return null;
+
+  try {
+    if (!cachedGifBuffer) {
+      console.log(`[GIF] Downloading GIF from: ${GIF_URL}`);
+
+      const res = await axios.get(GIF_URL, {
+        responseType: 'arraybuffer',
+        headers: imageHeaders(),
+        timeout: 20000,
+        maxContentLength: 25 * 1024 * 1024
+      });
+
+      cachedGifBuffer = Buffer.from(res.data);
+      console.log(`[GIF] Loaded GIF. Size: ${cachedGifBuffer.length} bytes`);
+    }
+
+    return new AttachmentBuilder(Buffer.from(cachedGifBuffer), {
+      name: 'yeti.gif'
+    });
+  } catch (err) {
+    gifDownloadFailed = true;
+    console.log('[GIF ERROR] Could not download GIF:', err?.response?.status || err.message);
+    return null;
+  }
 }
 
 async function fetchJson(url, label) {
@@ -113,7 +154,7 @@ async function fetchJson(url, label) {
         return res.data;
       }
 
-      console.log(`[Roblox] ${label} returned HTTP ${res.status}`);
+      console.log(`[Roblox] ${label} HTTP ${res.status}`);
     } catch (err) {
       console.log(`[Roblox] ${label} failed:`, err?.response?.status || err.message);
     }
@@ -168,15 +209,19 @@ function cleanNumber(value) {
 }
 
 async function getUniverseFromPlace(placeId) {
-  const modernUrl = `https://apis.roblox.com/universes/v1/places/${placeId}/universe`;
-  const modernData = await fetchJson(modernUrl, `modern universe lookup ${placeId}`);
+  const modernData = await fetchJson(
+    `https://apis.roblox.com/universes/v1/places/${placeId}/universe`,
+    `modern universe lookup ${placeId}`
+  );
 
   if (modernData?.universeId) {
     return String(modernData.universeId);
   }
 
-  const legacyUrl = `https://api.roblox.com/universes/get-universe-containing-place?placeid=${placeId}`;
-  const legacyData = await fetchJson(legacyUrl, `legacy universe lookup ${placeId}`);
+  const legacyData = await fetchJson(
+    `https://api.roblox.com/universes/get-universe-containing-place?placeid=${placeId}`,
+    `legacy universe lookup ${placeId}`
+  );
 
   if (legacyData?.UniverseId) {
     return String(legacyData.UniverseId);
@@ -242,34 +287,17 @@ async function getGameStatus(game) {
     return {
       ok: false,
       reason: 'bad_link',
-      players: 0,
+      players: null,
       name: game.name || 'Invalid Roblox Link',
       placeId: null,
       universeId: null
     };
   }
 
-  // First try place details because it can directly return playerCount.
-  const details = await getPlaceDetails(placeId);
-
-  if (details && details.ok) {
-    return {
-      ...details,
-      name: game.name || details.name || nameFromLink(game.link),
-      placeId: details.placeId || placeId
-    };
-  }
-
-  if (details && details.reason === 'not_playable_place_details') {
-    return {
-      ...details,
-      name: game.name || details.name || nameFromLink(game.link),
-      placeId: details.placeId || placeId
-    };
-  }
-
-  // Then get universe ID and use the main games API.
-  const universeId = details?.universeId || (await getUniverseFromPlace(placeId));
+  // IMPORTANT:
+  // First convert placeId -> universeId, then use games API.
+  // This gives the real "playing" count much more reliably.
+  const universeId = await getUniverseFromPlace(placeId);
 
   if (universeId) {
     const byUniverse = await getGameByUniverse(universeId);
@@ -277,14 +305,14 @@ async function getGameStatus(game) {
     if (byUniverse) {
       return {
         ...byUniverse,
-        name: game.name || byUniverse.name || details?.name || nameFromLink(game.link),
+        name: game.name || byUniverse.name || nameFromLink(game.link),
         placeId: byUniverse.rootPlaceId || placeId,
         universeId
       };
     }
   }
 
-  // Sometimes the URL ID may already be a universe ID.
+  // Backup: sometimes the ID behaves like universe ID.
   const directUniverse = await getGameByUniverse(placeId);
 
   if (directUniverse) {
@@ -299,12 +327,23 @@ async function getGameStatus(game) {
     };
   }
 
-  // Do not treat this as dead. This means Roblox gave no usable data.
+  // Final backup: place details.
+  const details = await getPlaceDetails(placeId);
+
+  if (details) {
+    return {
+      ...details,
+      name: game.name || details.name || nameFromLink(game.link),
+      placeId: details.placeId || placeId,
+      universeId: details.universeId || universeId
+    };
+  }
+
   return {
     ok: false,
     reason: 'no_api_data',
     players: null,
-    name: game.name || details?.name || nameFromLink(game.link),
+    name: game.name || nameFromLink(game.link),
     placeId,
     universeId: universeId || null
   };
@@ -355,10 +394,10 @@ function buildEmbed(state, game, status) {
     )
     .setFooter({ text: 'powered by yeti' });
 
-  if (GIF_URL && /^https?:\/\//i.test(GIF_URL)) {
+  if (state.hasGifAttachment) {
+    embed.setImage('attachment://yeti.gif');
+  } else if (GIF_URL && /^https?:\/\//i.test(GIF_URL)) {
     embed.setImage(GIF_URL);
-  } else if (GIF_URL) {
-    console.log(`[GIF ERROR] Invalid GIF_URL: ${GIF_URL}`);
   }
 
   return embed;
@@ -372,6 +411,23 @@ function buildNoGamesEmbed(state, reason) {
       `All games for **${state.label}** have failed real checks.\n\nLast reason: \`${reason}\`\n\nAdd more games to \`games.json\` and restart the bot.`
     )
     .setFooter({ text: 'powered by yeti' });
+}
+
+async function sendGameMessage(state, game, status) {
+  const gifAttachment = await getGifAttachment();
+
+  state.hasGifAttachment = Boolean(gifAttachment);
+
+  const payload = {
+    embeds: [buildEmbed(state, game, status)],
+    components: [buildButtons(state, game)]
+  };
+
+  if (gifAttachment) {
+    payload.files = [gifAttachment];
+  }
+
+  state.message = await state.channel.send(payload);
 }
 
 async function postCurrentGame(state) {
@@ -398,10 +454,7 @@ async function postCurrentGame(state) {
     state.lastGoodPlayers = status.players;
   }
 
-  state.message = await state.channel.send({
-    embeds: [buildEmbed(state, game, status)],
-    components: [buildButtons(state, game)]
-  });
+  await sendGameMessage(state, game, status);
 
   console.log(
     `[${state.label}] Posted game ${state.currentIndex + 1}/${state.games.length}: ${game.link}`
