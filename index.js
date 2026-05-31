@@ -9,18 +9,12 @@ const {
   EmbedBuilder,
   ActionRowBuilder,
   ButtonBuilder,
-  ButtonStyle,
-  AttachmentBuilder
+  ButtonStyle
 } = require('discord.js');
 
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
 const CHECK_INTERVAL_MS = Number(process.env.CHECK_INTERVAL_MS || 30000);
-const FAILS_BEFORE_SWITCH = Number(process.env.FAILS_BEFORE_SWITCH || 3);
-
-const GIF_URL = (process.env.GIF_URL || '')
-  .trim()
-  .replace(/^["']|["']$/g, '');
-
+const GIF_URL = (process.env.GIF_URL || '').trim().replace(/^["']|["']$/g, '');
 const ROBLOSECURITY = (process.env.ROBLOSECURITY || '').trim();
 
 const CHANNEL_CONFIGS = [
@@ -51,9 +45,6 @@ const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages]
 });
 
-let cachedGifBuffer = null;
-let gifDownloadFailed = false;
-
 function normalizeGames(raw) {
   return raw
     .map((item) => (typeof item === 'string' ? { link: item } : item))
@@ -74,112 +65,12 @@ const states = CHANNEL_CONFIGS.map((config) => ({
   ),
   currentIndex: 0,
   startTime: Date.now(),
-  failCounts: new Map(),
-  lastGoodPlayers: null,
   exhausted: false,
-  isUpdating: false,
-  hasGifAttachment: false
+  isUpdating: false
 }));
-
-function robloxHeaders() {
-  const headers = {
-    'User-Agent':
-      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36',
-    Accept: 'application/json,text/plain,*/*',
-    'Accept-Language': 'en-US,en;q=0.9',
-    Referer: 'https://www.roblox.com/'
-  };
-
-  if (
-    ROBLOSECURITY &&
-    !ROBLOSECURITY.includes('PASTE_YOUR') &&
-    !ROBLOSECURITY.includes('optional_only')
-  ) {
-    headers.Cookie = `.ROBLOSECURITY=${ROBLOSECURITY}`;
-  }
-
-  return headers;
-}
-
-function imageHeaders() {
-  return {
-    'User-Agent':
-      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36',
-    Accept: 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8'
-  };
-}
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-async function getGifAttachment() {
-  if (!GIF_URL || gifDownloadFailed) return null;
-
-  try {
-    if (!cachedGifBuffer) {
-      console.log(`[GIF] Downloading GIF from: ${GIF_URL}`);
-
-      const res = await axios.get(GIF_URL, {
-        responseType: 'arraybuffer',
-        headers: imageHeaders(),
-        timeout: 20000,
-        maxContentLength: 25 * 1024 * 1024
-      });
-
-      cachedGifBuffer = Buffer.from(res.data);
-      console.log(`[GIF] Loaded GIF. Size: ${cachedGifBuffer.length} bytes`);
-    }
-
-    return new AttachmentBuilder(Buffer.from(cachedGifBuffer), {
-      name: 'yeti.gif'
-    });
-  } catch (err) {
-    gifDownloadFailed = true;
-    console.log('[GIF ERROR] Could not download GIF:', err?.response?.status || err.message);
-    return null;
-  }
-}
-
-async function fetchJson(url, label) {
-  for (let attempt = 1; attempt <= 2; attempt++) {
-    try {
-      const res = await axios.get(url, {
-        headers: robloxHeaders(),
-        timeout: 15000,
-        validateStatus: (status) => status >= 200 && status < 500
-      });
-
-      if (res.status >= 200 && res.status < 300) {
-        return res.data;
-      }
-
-      console.log(`[Roblox] ${label} HTTP ${res.status}`);
-    } catch (err) {
-      console.log(`[Roblox] ${label} failed:`, err?.response?.status || err.message);
-    }
-
-    await sleep(700);
-  }
-
-  return null;
-}
-
-function extractUrlId(link) {
-  const match = link.match(/roblox\.com\/games\/(\d+)/i);
-  return match ? match[1] : null;
-}
-
-function nameFromLink(link) {
-  const slug = link
-    .split('/games/')[1]
-    ?.split('/')[1]
-    ?.split('?')[0]
-    ?.split('#')[0];
-
-  if (!slug) return 'Roblox Game';
-
-  return decodeURIComponent(slug).replace(/-/g, ' ');
 }
 
 function getUptime(state) {
@@ -194,102 +85,88 @@ function getUptime(state) {
   return `${m}m ${s}s`;
 }
 
-function shouldSwitchGame(status) {
-  return [
-    'not_playable',
-    'not_playable_place_details',
-    'bad_link'
-  ].includes(status.reason);
+function nameFromLink(link) {
+  const slug = link
+    .split('/games/')[1]
+    ?.split('/')[1]
+    ?.split('?')[0]
+    ?.split('#')[0];
+
+  if (!slug) return 'Roblox Game';
+
+  return decodeURIComponent(slug).replace(/-/g, ' ');
 }
 
-function cleanNumber(value) {
-  const num = Number(value);
-  if (Number.isFinite(num)) return num;
-  return 0;
-}
+function getRobloxConfig() {
+  const headers = {
+    'User-Agent':
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36'
+  };
 
-async function getUniverseFromPlace(placeId) {
-  const data = await fetchJson(
-    `https://apis.roblox.com/universes/v1/places/${placeId}/universe`,
-    `place -> universe lookup ${placeId}`
-  );
-
-  if (data?.universeId) {
-    return String(data.universeId);
+  if (
+    ROBLOSECURITY &&
+    !ROBLOSECURITY.includes('PASTE_YOUR') &&
+    !ROBLOSECURITY.includes('optional_only')
+  ) {
+    headers.Cookie = `.ROBLOSECURITY=${ROBLOSECURITY}`;
   }
 
-  return null;
+  return {
+    headers,
+    timeout: 15000
+  };
 }
 
-async function getGameByUniverse(universeId) {
-  const data = await fetchJson(
-    `https://games.roblox.com/v1/games?universeIds=${universeId}`,
-    `universe game stats ${universeId}`
-  );
+/* ---------------- WORKING PLAYER FETCHER ---------------- */
+async function getPlayers(link) {
+  try {
+    const match = link.match(/\d+/);
+    if (!match) return null;
 
-  const game = data?.data?.[0];
+    const extractedId = match[0];
+    const config = getRobloxConfig();
 
-  if (!game) {
+    let universeId = null;
+
+    try {
+      const uniRes = await axios.get(
+        `https://apis.roblox.com/universes/v1/places/${extractedId}/universe`,
+        config
+      );
+
+      universeId = uniRes.data?.universeId;
+    } catch (err) {
+      console.log(
+        `[Roblox] Universe lookup failed for ${extractedId}. Trying ID directly as universeId.`
+      );
+
+      universeId = extractedId;
+    }
+
+    if (universeId) {
+      const gameRes = await axios.get(
+        `https://games.roblox.com/v1/games?universeIds=${universeId}`,
+        config
+      );
+
+      const data = gameRes.data?.data?.[0];
+
+      if (data && data.playing !== undefined) {
+        return {
+          players: Number(data.playing || 0),
+          name: data.name || null,
+          isPlayable: data.isPlayable !== false,
+          universeId: String(data.id || universeId),
+          rootPlaceId: data.rootPlaceId ? String(data.rootPlaceId) : extractedId
+        };
+      }
+    }
+
+    return null;
+  } catch (err) {
+    console.log('[Roblox] getPlayers error:', err?.response?.status || err.message);
     return null;
   }
-
-  return {
-    ok: game.isPlayable !== false,
-    reason: game.isPlayable === false ? 'not_playable' : 'online',
-    name: game.name || null,
-    players: cleanNumber(game.playing),
-    visits: cleanNumber(game.visits),
-    rootPlaceId: game.rootPlaceId ? String(game.rootPlaceId) : null,
-    universeId: String(game.id || universeId)
-  };
-}
-
-async function getGameStatus(game) {
-  const placeId = extractUrlId(game.link);
-
-  if (!placeId) {
-    return {
-      ok: false,
-      reason: 'bad_link',
-      players: null,
-      name: game.name || 'Invalid Roblox Link',
-      placeId: null,
-      universeId: null
-    };
-  }
-
-  const universeId = await getUniverseFromPlace(placeId);
-
-  if (!universeId) {
-    return {
-      ok: false,
-      reason: 'no_universe_id',
-      players: null,
-      name: game.name || nameFromLink(game.link),
-      placeId,
-      universeId: null
-    };
-  }
-
-  const byUniverse = await getGameByUniverse(universeId);
-
-  if (!byUniverse) {
-    return {
-      ok: false,
-      reason: 'no_game_data',
-      players: null,
-      name: game.name || nameFromLink(game.link),
-      placeId,
-      universeId
-    };
-  }
-
-  return {
-    ...byUniverse,
-    name: game.name || byUniverse.name || nameFromLink(game.link),
-    placeId: byUniverse.rootPlaceId || placeId,
-    universeId
-  };
 }
 
 function buildButtons(state, game) {
@@ -306,27 +183,29 @@ function buildButtons(state, game) {
   );
 }
 
-function buildEmbed(state, game, status) {
-  let playersText = '0';
+function buildEmbed(state, game, playerData) {
+  const players =
+    playerData && playerData.players !== null && playerData.players !== undefined
+      ? playerData.players
+      : 'N/A';
 
-  if (status.players !== null && status.players !== undefined) {
-    playersText = String(status.players);
-  } else if (state.lastGoodPlayers !== null && state.lastGoodPlayers !== undefined) {
-    playersText = String(state.lastGoodPlayers);
-  }
+  const gameName =
+    playerData?.name ||
+    game.name ||
+    nameFromLink(game.link);
 
   const embed = new EmbedBuilder()
     .setColor(0x2b2d31)
-    .setTitle(`🎮 ${status.name || nameFromLink(game.link)}`)
+    .setTitle(`🎮 ${gameName}`)
     .addFields(
       {
-        name: '📡 active players',
-        value: playersText,
+        name: '((•)) active players',
+        value: `\`${players}\``,
         inline: true
       },
       {
         name: '🕒 server uptime',
-        value: getUptime(state),
+        value: `\`${getUptime(state)}\``,
         inline: true
       },
       {
@@ -337,78 +216,32 @@ function buildEmbed(state, game, status) {
     )
     .setFooter({ text: 'powered by yeti' });
 
-  if (state.hasGifAttachment) {
-    embed.setImage('attachment://yeti.gif');
-  } else if (GIF_URL && /^https?:\/\//i.test(GIF_URL)) {
+  if (GIF_URL && /^https?:\/\//i.test(GIF_URL)) {
     embed.setImage(GIF_URL);
   }
 
   return embed;
 }
 
-function buildNoGamesEmbed(state, reason) {
+function buildNoGamesEmbed(state) {
   return new EmbedBuilder()
     .setColor(0xff0000)
     .setTitle('⚠ No working games left')
     .setDescription(
-      `All games for **${state.label}** have failed real checks.\n\nLast reason: \`${reason}\`\n\nAdd more games to \`games.json\` and restart the bot.`
+      `All games for **${state.label}** are dead, banned, deleted, or inaccessible.\n\nAdd more games to \`games.json\` and restart the bot.`
     )
     .setFooter({ text: 'powered by yeti' });
 }
 
-async function sendGameMessage(state, game, status) {
-  const gifAttachment = await getGifAttachment();
-
-  state.hasGifAttachment = Boolean(gifAttachment);
-
-  const payload = {
-    embeds: [buildEmbed(state, game, status)],
+async function postGame(state, game, playerData) {
+  state.message = await state.channel.send({
+    embeds: [buildEmbed(state, game, playerData)],
     components: [buildButtons(state, game)]
-  };
-
-  if (gifAttachment) {
-    payload.files = [gifAttachment];
-  }
-
-  state.message = await state.channel.send(payload);
+  });
 }
 
-async function postCurrentGame(state) {
-  if (state.exhausted) return;
-
-  const game = state.games[state.currentIndex];
-
-  if (!game) {
-    state.exhausted = true;
-
-    state.message = await state.channel.send({
-      embeds: [buildNoGamesEmbed(state, 'missing_game')]
-    });
-
-    return;
-  }
-
-  state.startTime = Date.now();
-  state.lastGoodPlayers = null;
-
-  const status = await getGameStatus(game);
-
-  if (status.players !== null && status.players !== undefined) {
-    state.lastGoodPlayers = status.players;
-  }
-
-  await sendGameMessage(state, game, status);
-
-  console.log(
-    `[${state.label}] Posted game ${state.currentIndex + 1}/${state.games.length}: ${game.link}`
-  );
-}
-
-async function stopChannelBecauseNoGamesLeft(state, reason) {
-  console.log(`[${state.label}] No more games left. Stopping this channel.`);
-
+async function stopChannel(state) {
   state.exhausted = true;
-  state.failCounts.clear();
 
   if (state.message) {
     await state.message.delete().catch(() => {});
@@ -416,12 +249,12 @@ async function stopChannelBecauseNoGamesLeft(state, reason) {
   }
 
   state.message = await state.channel.send({
-    embeds: [buildNoGamesEmbed(state, reason)]
+    embeds: [buildNoGamesEmbed(state)]
   });
 }
 
-async function switchToNextGame(state, reason) {
-  console.log(`[${state.label}] Switching game. Reason: ${reason}`);
+async function moveToNextGame(state) {
+  console.log(`[${state.label}] Moving to next game.`);
 
   if (state.message) {
     await state.message.delete().catch(() => {});
@@ -431,14 +264,27 @@ async function switchToNextGame(state, reason) {
   state.currentIndex += 1;
 
   if (state.currentIndex >= state.games.length) {
-    await stopChannelBecauseNoGamesLeft(state, reason);
+    console.log(`[${state.label}] Reached end of games list.`);
+    await stopChannel(state);
     return;
   }
 
-  state.failCounts.clear();
+  state.startTime = Date.now();
 
-  await sleep(1000);
-  await postCurrentGame(state);
+  const nextGame = state.games[state.currentIndex];
+  const nextPlayers = await getPlayers(nextGame.link);
+
+  if (!nextPlayers || nextPlayers.isPlayable === false) {
+    console.log(`[${state.label}] Next game is also dead: ${nextGame.link}`);
+    await moveToNextGame(state);
+    return;
+  }
+
+  await postGame(state, nextGame, nextPlayers);
+
+  console.log(
+    `[${state.label}] Posted next game ${state.currentIndex + 1}/${state.games.length}: ${nextGame.link}`
+  );
 }
 
 async function updateState(state) {
@@ -450,98 +296,74 @@ async function updateState(state) {
   state.isUpdating = true;
 
   try {
-    if (!state.games.length) return;
+    if (!state.channel || !state.games.length) return;
     if (state.exhausted) return;
 
     if (state.currentIndex >= state.games.length) {
-      await stopChannelBecauseNoGamesLeft(state, 'index_out_of_range');
-      return;
-    }
-
-    if (!state.message) {
-      await postCurrentGame(state);
+      await stopChannel(state);
       return;
     }
 
     const game = state.games[state.currentIndex];
+    const playerData = await getPlayers(game.link);
 
-    if (!game) {
-      await stopChannelBecauseNoGamesLeft(state, 'missing_game');
+    console.log(
+      `[${state.label}] [check] ${game.link} | players=${playerData?.players ?? 'null'} | playable=${playerData?.isPlayable ?? 'unknown'} | universeId=${playerData?.universeId ?? 'null'}`
+    );
+
+    // dead / banned / deleted / private / inaccessible
+    if (!playerData || playerData.isPlayable === false) {
+      console.log(`[${state.label}] Game dead or inaccessible: ${game.link}`);
+      await moveToNextGame(state);
       return;
     }
 
-    const status = await getGameStatus(game);
-    const key = game.link;
+    if (!messageExists(state)) {
+      state.startTime = Date.now();
 
-    console.log(
-      `[${state.label}] [check] ${status.name} | placeId=${status.placeId} | universeId=${status.universeId} | ok=${status.ok} | players=${status.players} | reason=${status.reason}`
-    );
-
-    if (status.players !== null && status.players !== undefined) {
-      state.lastGoodPlayers = status.players;
-    }
-
-    await state.message
-      .edit({
-        embeds: [buildEmbed(state, game, status)],
-        components: [buildButtons(state, game)]
-      })
-      .catch(async () => {
-        console.log(`[${state.label}] Message edit failed. Reposting current game.`);
-        state.message = null;
-        await postCurrentGame(state);
-      });
-
-    if (!status.ok) {
-      if (!shouldSwitchGame(status)) {
-        console.log(
-          `[${state.label}] Not switching. "${status.reason}" is not confirmed dead.`
-        );
-        return;
-      }
-
-      const fails = (state.failCounts.get(key) || 0) + 1;
-      state.failCounts.set(key, fails);
+      await postGame(state, game, playerData);
 
       console.log(
-        `[${state.label}] Real fail count: ${fails}/${FAILS_BEFORE_SWITCH}`
+        `[${state.label}] Posted game ${state.currentIndex + 1}/${state.games.length}: ${game.link}`
       );
-
-      if (fails >= FAILS_BEFORE_SWITCH) {
-        await switchToNextGame(state, status.reason);
-      }
 
       return;
     }
 
-    state.failCounts.set(key, 0);
+    await state.message.edit({
+      embeds: [buildEmbed(state, game, playerData)],
+      components: [buildButtons(state, game)]
+    });
   } catch (err) {
-    console.log(
-      `[${state.label}] UPDATE ERROR:`,
-      err?.response?.data || err.message
-    );
+    console.log(`[${state.label}] UPDATE ERROR:`, err?.response?.data || err.message);
   } finally {
     state.isUpdating = false;
   }
 }
 
+function messageExists(state) {
+  return Boolean(state.message);
+}
+
 client.once('clientReady', async () => {
   console.log(`Logged in as ${client.user.tag}`);
-  console.log(
-    `Checking every ${CHECK_INTERVAL_MS / 1000}s. Fails before switch: ${FAILS_BEFORE_SWITCH}.`
-  );
+  console.log(`Checking every ${CHECK_INTERVAL_MS / 1000}s.`);
   console.log(`GIF_URL loaded: ${GIF_URL || 'none'}`);
 
   for (const state of states) {
     if (!state.games.length) {
-      console.log(
-        `[${state.label}] No valid games found in games.json for channel ${state.id}.`
-      );
+      console.log(`[${state.label}] No valid games found in games.json for channel ${state.id}.`);
       continue;
     }
 
-    state.channel = await client.channels.fetch(state.channelId);
-    await postCurrentGame(state);
+    state.channel = await client.channels.fetch(state.channelId).catch(() => null);
+
+    if (!state.channel) {
+      console.log(`[${state.label}] Failed to fetch Discord channel.`);
+      continue;
+    }
+
+    await updateState(state);
   }
 
   setInterval(() => {
