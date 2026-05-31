@@ -19,12 +19,14 @@ const FAILS_BEFORE_SWITCH = Number(process.env.FAILS_BEFORE_SWITCH || 3);
 const GIF_URL = (process.env.GIF_URL || '').trim().replace(/^["']|["']$/g, '');
 
 function cleanRoblosecurity(value) {
-  let cookie = (value || '').trim();
-  cookie = cookie.replace(/^["']|["']$/g, '');
+  let cookie = String(value || '').trim();
 
-  if (cookie.startsWith('.ROBLOSECURITY=')) {
-    cookie = cookie.slice('.ROBLOSECURITY='.length);
-  }
+  cookie = cookie.replace(/^["']|["']$/g, '');
+  cookie = cookie.replace(/^Cookie:\s*/i, '');
+  cookie = cookie.replace(/^\.ROBLOSECURITY\s*=\s*/i, '');
+  cookie = cookie.replace(/^ROBLOSECURITY\s*=\s*/i, '');
+  cookie = cookie.replace(/;$/, '');
+  cookie = cookie.replace(/\r?\n|\r/g, '').trim();
 
   return cookie;
 }
@@ -56,8 +58,7 @@ if (!DISCORD_TOKEN || !process.env.CHANNEL_1_ID || !process.env.CHANNEL_2_ID) {
 }
 
 if (!ROBLOSECURITY) {
-  console.error('Missing ROBLOSECURITY. Bot will not check Roblox games without being logged in.');
-  process.exit(1);
+  console.warn('WARNING: ROBLOSECURITY is missing. Private/group games may not check correctly.');
 }
 
 const client = new Client({
@@ -98,21 +99,9 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function getUptime(state) {
-  const sec = Math.floor((Date.now() - state.startTime) / 1000);
-  const d = Math.floor(sec / 86400);
-  const h = Math.floor((sec % 86400) / 3600);
-  const m = Math.floor((sec % 3600) / 60);
-  const s = sec % 60;
-
-  if (d > 0) return `${d}d ${h}h ${m}m`;
-  if (h > 0) return `${h}h ${m}m ${s}s`;
-  return `${m}m ${s}s`;
-}
-
 function extractIdFromLink(link) {
-  const match = link.match(/\d+/);
-  return match ? match[0] : null;
+  const match = link.match(/roblox\.com\/games\/(\d+)/i) || link.match(/\d+/);
+  return match ? match[1] || match[0] : null;
 }
 
 function nameFromLink(link) {
@@ -127,22 +116,45 @@ function nameFromLink(link) {
   return decodeURIComponent(slug).replace(/-/g, ' ');
 }
 
-function getRobloxConfig() {
+function getUptime(state) {
+  const sec = Math.floor((Date.now() - state.startTime) / 1000);
+  const d = Math.floor(sec / 86400);
+  const h = Math.floor((sec % 86400) / 3600);
+  const m = Math.floor((sec % 3600) / 60);
+  const s = sec % 60;
+
+  if (d > 0) return `${d}d ${h}h ${m}m`;
+  if (h > 0) return `${h}h ${m}m ${s}s`;
+  return `${m}m ${s}s`;
+}
+
+function robloxHeaders(extra = {}) {
+  const headers = {
+    'User-Agent':
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    Accept: 'application/json,text/plain,*/*',
+    'Accept-Language': 'en-US,en;q=0.9',
+    Referer: 'https://www.roblox.com/',
+    Origin: 'https://www.roblox.com',
+    ...extra
+  };
+
+  if (ROBLOSECURITY) {
+    headers.Cookie = `.ROBLOSECURITY=${ROBLOSECURITY};`;
+  }
+
+  return headers;
+}
+
+function robloxConfig(extra = {}) {
   return {
-    headers: {
-      'User-Agent':
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-      Accept: 'application/json,text/plain,*/*',
-      'Accept-Language': 'en-US,en;q=0.9',
-      Referer: 'https://www.roblox.com/',
-      Cookie: `.ROBLOSECURITY=${ROBLOSECURITY}`
-    },
+    headers: robloxHeaders(extra),
     timeout: 15000,
     validateStatus: (status) => status >= 200 && status < 500
   };
 }
 
-function getImageConfig() {
+function imageConfig() {
   return {
     responseType: 'arraybuffer',
     timeout: 20000,
@@ -155,13 +167,13 @@ function getImageConfig() {
   };
 }
 
-/* ---------------- VERIFY ROBLOX LOGIN FIRST ---------------- */
+/* ---------------- SOFT COOKIE CHECK ---------------- */
 
-async function verifyRobloxCookie() {
+async function softVerifyRobloxCookie() {
   try {
     const res = await axios.get(
       'https://users.roblox.com/v1/users/authenticated',
-      getRobloxConfig()
+      robloxConfig()
     );
 
     if (res.status === 200 && res.data?.id) {
@@ -169,15 +181,15 @@ async function verifyRobloxCookie() {
       return true;
     }
 
-    console.log(`[Roblox Login] Cookie failed. HTTP ${res.status}`, res.data);
+    console.log(`[Roblox Login] Soft check failed HTTP ${res.status}. Continuing anyway.`);
     return false;
   } catch (err) {
-    console.log('[Roblox Login] Cookie check error:', err?.response?.status || err.message);
+    console.log('[Roblox Login] Soft check error. Continuing anyway:', err?.response?.status || err.message);
     return false;
   }
 }
 
-/* ---------------- GIF ATTACHMENT ---------------- */
+/* ---------------- GIF ---------------- */
 
 async function getGifAttachment() {
   if (!GIF_URL || gifDownloadFailed) return null;
@@ -186,7 +198,7 @@ async function getGifAttachment() {
     if (!cachedGifBuffer) {
       console.log(`[GIF] Downloading GIF from: ${GIF_URL}`);
 
-      const res = await axios.get(GIF_URL, getImageConfig());
+      const res = await axios.get(GIF_URL, imageConfig());
 
       cachedGifBuffer = Buffer.from(res.data);
       console.log(`[GIF] Loaded GIF. Size: ${cachedGifBuffer.length} bytes`);
@@ -202,43 +214,102 @@ async function getGifAttachment() {
   }
 }
 
-/* ---------------- ROBLOX GAME CHECKER ---------------- */
+/* ---------------- ROBLOX CHECKS ---------------- */
 
-async function getUniverseIdFromPlaceId(placeId) {
+async function fetchPlaceDetails(placeId) {
+  const urls = [
+    `https://games.roblox.com/v1/games/multiget-place-details?placeIds=${placeId}`,
+    `https://www.roblox.com/games/multiget-place-details?placeIds=${placeId}`
+  ];
+
+  for (const url of urls) {
+    try {
+      const res = await axios.get(url, robloxConfig());
+
+      if (res.status >= 400) {
+        console.log(`[Roblox] Place details HTTP ${res.status} for placeId=${placeId}`);
+        continue;
+      }
+
+      const data = Array.isArray(res.data) ? res.data[0] : null;
+      if (data) return data;
+    } catch (err) {
+      console.log('[Roblox] Place details error:', err?.response?.status || err.message);
+    }
+  }
+
+  return null;
+}
+
+async function fetchUniverseId(placeId) {
   try {
     const res = await axios.get(
       `https://apis.roblox.com/universes/v1/places/${placeId}/universe`,
-      getRobloxConfig()
+      robloxConfig()
     );
 
     if (res.status >= 400) {
-      console.log(`[Roblox] placeId -> universeId failed. HTTP ${res.status} for placeId=${placeId}`);
+      console.log(`[Roblox] Universe lookup HTTP ${res.status} for placeId=${placeId}`);
       return null;
     }
 
     return res.data?.universeId ? String(res.data.universeId) : null;
   } catch (err) {
-    console.log('[Roblox] placeId -> universeId error:', err?.response?.status || err.message);
+    console.log('[Roblox] Universe lookup error:', err?.response?.status || err.message);
     return null;
   }
 }
 
-async function getGameDataFromUniverseId(universeId) {
+async function fetchGameData(universeId) {
   try {
     const res = await axios.get(
       `https://games.roblox.com/v1/games?universeIds=${universeId}`,
-      getRobloxConfig()
+      robloxConfig()
     );
 
     if (res.status >= 400) {
-      console.log(`[Roblox] universe game lookup failed. HTTP ${res.status} for universeId=${universeId}`);
+      console.log(`[Roblox] Game lookup HTTP ${res.status} for universeId=${universeId}`);
       return null;
     }
 
     return res.data?.data?.[0] || null;
   } catch (err) {
-    console.log('[Roblox] universe game lookup error:', err?.response?.status || err.message);
+    console.log('[Roblox] Game lookup error:', err?.response?.status || err.message);
     return null;
+  }
+}
+
+async function fetchGamePage(link) {
+  try {
+    const res = await axios.get(link, {
+      headers: robloxHeaders({
+        Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
+      }),
+      timeout: 15000,
+      validateStatus: (status) => status >= 200 && status < 500
+    });
+
+    const html = typeof res.data === 'string' ? res.data : '';
+
+    const looksDead =
+      res.status === 404 ||
+      res.status === 403 ||
+      /experience is unavailable/i.test(html) ||
+      /content deleted/i.test(html) ||
+      /this experience is not available/i.test(html) ||
+      /not approved/i.test(html);
+
+    return {
+      status: res.status,
+      looksDead
+    };
+  } catch (err) {
+    console.log('[Roblox] Game page check error:', err?.response?.status || err.message);
+
+    return {
+      status: null,
+      looksDead: false
+    };
   }
 }
 
@@ -248,6 +319,7 @@ async function checkGame(link) {
   if (!placeId) {
     return {
       ok: false,
+      confirmedDead: true,
       reason: 'bad_link',
       players: null,
       name: 'Invalid Roblox Link',
@@ -256,29 +328,54 @@ async function checkGame(link) {
     };
   }
 
-  const universeId = await getUniverseIdFromPlaceId(placeId);
+  const [page, details] = await Promise.all([
+    fetchGamePage(link),
+    fetchPlaceDetails(placeId)
+  ]);
 
-  console.log(`[Roblox] placeId=${placeId} universeId=${universeId || 'null'}`);
+  if (details?.isPlayable === false) {
+    return {
+      ok: false,
+      confirmedDead: true,
+      reason: 'not_playable_place_details',
+      players: null,
+      name: details.name || details.Name || nameFromLink(link),
+      placeId,
+      universeId: details.universeId ? String(details.universeId) : null
+    };
+  }
+
+  let universeId = details?.universeId ? String(details.universeId) : null;
+
+  if (!universeId) {
+    universeId = await fetchUniverseId(placeId);
+  }
+
+  console.log(
+    `[Roblox] placeId=${placeId} universeId=${universeId || 'null'} pageStatus=${page.status || 'null'} pageDead=${page.looksDead ? 'yes' : 'no'}`
+  );
 
   if (!universeId) {
     return {
       ok: false,
-      reason: 'no_universe_id',
+      confirmedDead: page.looksDead,
+      reason: page.looksDead ? 'page_dead_no_universe' : 'no_universe_id',
       players: null,
-      name: nameFromLink(link),
+      name: details?.name || details?.Name || nameFromLink(link),
       placeId,
       universeId: null
     };
   }
 
-  const data = await getGameDataFromUniverseId(universeId);
+  const data = await fetchGameData(universeId);
 
   if (!data) {
     return {
       ok: false,
-      reason: 'no_game_data',
+      confirmedDead: page.looksDead,
+      reason: page.looksDead ? 'page_dead_no_game_data' : 'no_game_data',
       players: null,
-      name: nameFromLink(link),
+      name: details?.name || details?.Name || nameFromLink(link),
       placeId,
       universeId
     };
@@ -287,51 +384,55 @@ async function checkGame(link) {
   if (data.isPlayable === false) {
     return {
       ok: false,
+      confirmedDead: true,
       reason: 'not_playable',
       players: null,
-      name: data.name || nameFromLink(link),
+      name: data.name || details?.name || nameFromLink(link),
       placeId: data.rootPlaceId ? String(data.rootPlaceId) : placeId,
       universeId: String(data.id || universeId)
     };
   }
 
-  if (data.playing === undefined || data.playing === null) {
+  if (data.playing !== undefined && data.playing !== null) {
     return {
-      ok: false,
-      reason: 'no_playing_field',
-      players: null,
-      name: data.name || nameFromLink(link),
+      ok: true,
+      confirmedDead: false,
+      reason: 'online',
+      players: Number(data.playing || 0),
+      name: data.name || details?.name || nameFromLink(link),
       placeId: data.rootPlaceId ? String(data.rootPlaceId) : placeId,
       universeId: String(data.id || universeId)
     };
   }
 
   return {
-    ok: true,
-    reason: 'online',
-    players: Number(data.playing || 0),
-    name: data.name || nameFromLink(link),
+    ok: false,
+    confirmedDead: page.looksDead,
+    reason: page.looksDead ? 'page_dead_no_players' : 'no_playing_field',
+    players: null,
+    name: data.name || details?.name || nameFromLink(link),
     placeId: data.rootPlaceId ? String(data.rootPlaceId) : placeId,
     universeId: String(data.id || universeId)
   };
 }
 
 async function testGameBeforePosting(game, state) {
+  let lastResult = null;
+
   for (let attempt = 1; attempt <= FAILS_BEFORE_SWITCH; attempt++) {
-    const result = await checkGame(game.link);
+    lastResult = await checkGame(game.link);
 
     console.log(
-      `[${state.label}] Pre-post test ${attempt}/${FAILS_BEFORE_SWITCH} | ${game.link} | ok=${result.ok} | players=${result.players ?? 'null'} | reason=${result.reason} | universeId=${result.universeId ?? 'null'}`
+      `[${state.label}] Pre-post test ${attempt}/${FAILS_BEFORE_SWITCH} | ${game.link} | ok=${lastResult.ok} | dead=${lastResult.confirmedDead} | players=${lastResult.players ?? 'null'} | reason=${lastResult.reason} | universeId=${lastResult.universeId ?? 'null'}`
     );
 
-    if (result.ok) {
-      return result;
-    }
+    if (lastResult.ok) return lastResult;
+    if (lastResult.confirmedDead) return lastResult;
 
     await sleep(1000);
   }
 
-  return null;
+  return lastResult;
 }
 
 /* ---------------- DISCORD ---------------- */
@@ -351,15 +452,13 @@ function buildButtons(state, game) {
 }
 
 function buildEmbed(state, game, playerData) {
-  const usableData = playerData || state.lastPlayerData;
-
   const players =
-    usableData && usableData.players !== null && usableData.players !== undefined
-      ? usableData.players
+    playerData && playerData.players !== null && playerData.players !== undefined
+      ? playerData.players
       : 'N/A';
 
   const gameName =
-    usableData?.name ||
+    playerData?.name ||
     game.name ||
     nameFromLink(game.link);
 
@@ -394,7 +493,6 @@ function buildEmbed(state, game, playerData) {
 
 async function sendGameMessage(state, game, playerData) {
   const gifAttachment = await getGifAttachment();
-
   state.gifAttached = Boolean(gifAttachment);
 
   const payload = {
@@ -416,7 +514,7 @@ async function editGameMessage(state, game, playerData) {
   });
 }
 
-/* ---------------- GAME FLOW ---------------- */
+/* ---------------- FLOW ---------------- */
 
 async function clearChannelMessage(state) {
   if (state.message) {
@@ -428,7 +526,7 @@ async function clearChannelMessage(state) {
 async function stopChannelSilently(state) {
   state.exhausted = true;
   await clearChannelMessage(state);
-  console.log(`[${state.label}] No working games left. Not posting anything for this channel.`);
+  console.log(`[${state.label}] No working games left. Staying silent for this channel.`);
 }
 
 async function findAndPostNextWorkingGame(state) {
@@ -446,7 +544,7 @@ async function findAndPostNextWorkingGame(state) {
 
     const result = await testGameBeforePosting(game, state);
 
-    if (result) {
+    if (result?.ok) {
       state.startTime = Date.now();
       state.failCount = 0;
       state.lastPlayerData = result;
@@ -461,7 +559,7 @@ async function findAndPostNextWorkingGame(state) {
     }
 
     console.log(
-      `[${state.label}] Skipping game because it failed ${FAILS_BEFORE_SWITCH} pre-post checks: ${game.link}`
+      `[${state.label}] Skipping not-working game ${state.currentIndex + 1}/${state.games.length}: ${game.link} | reason=${result?.reason ?? 'unknown'} | dead=${result?.confirmedDead ?? false}`
     );
 
     state.currentIndex += 1;
@@ -497,7 +595,7 @@ async function updateState(state) {
     const result = await checkGame(game.link);
 
     console.log(
-      `[${state.label}] Live check | ${game.link} | ok=${result.ok} | players=${result.players ?? 'null'} | fails=${state.failCount}/${FAILS_BEFORE_SWITCH} | reason=${result.reason} | universeId=${result.universeId ?? 'null'}`
+      `[${state.label}] Live check | ${game.link} | ok=${result.ok} | dead=${result.confirmedDead} | players=${result.players ?? 'null'} | fails=${state.failCount}/${FAILS_BEFORE_SWITCH} | reason=${result.reason} | universeId=${result.universeId ?? 'null'}`
     );
 
     if (result.ok) {
@@ -510,12 +608,8 @@ async function updateState(state) {
 
     state.failCount += 1;
 
-    console.log(
-      `[${state.label}] Current game failed live check ${state.failCount}/${FAILS_BEFORE_SWITCH}: ${game.link}`
-    );
-
-    if (state.failCount >= FAILS_BEFORE_SWITCH) {
-      console.log(`[${state.label}] Deleting failed game and moving to next: ${game.link}`);
+    if (result.confirmedDead || state.failCount >= FAILS_BEFORE_SWITCH) {
+      console.log(`[${state.label}] Removing current game and moving next: ${game.link}`);
 
       state.currentIndex += 1;
       await findAndPostNextWorkingGame(state);
@@ -532,21 +626,19 @@ async function updateState(state) {
   }
 }
 
-/* ---------------- BOT READY ---------------- */
+/* ---------------- READY ---------------- */
 
-client.once('ready', async () => {
+client.once('clientReady', async () => {
   console.log(`Logged in as ${client.user.tag}`);
   console.log(`Checking every ${CHECK_INTERVAL_MS / 1000}s.`);
   console.log(`Pre-post tests / fail checks: ${FAILS_BEFORE_SWITCH}`);
   console.log(`GIF_URL loaded: ${GIF_URL || 'none'}`);
   console.log(`ROBLOSECURITY loaded: ${ROBLOSECURITY ? 'yes' : 'no'}`);
+  console.log(`ROBLOSECURITY length: ${ROBLOSECURITY.length}`);
+  console.log(`ROBLOSECURITY starts with warning: ${ROBLOSECURITY.startsWith('_|WARNING') ? 'yes' : 'no'}`);
+  console.log(`ROBLOSECURITY has spaces/newlines: ${/\s/.test(ROBLOSECURITY) ? 'yes' : 'no'}`);
 
-  const robloxLoggedIn = await verifyRobloxCookie();
-
-  if (!robloxLoggedIn) {
-    console.log('ROBLOSECURITY is invalid, expired, or missing. Stopping bot so it does not falsely mark games as banned.');
-    return;
-  }
+  await softVerifyRobloxCookie();
 
   for (const state of states) {
     if (!state.games.length) {
