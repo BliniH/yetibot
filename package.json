@@ -1,14 +1,17 @@
 {
-  "name": "yeti-roblox-monitor-bot",
+  "name": "yeti-open-cloud-publisher",
   "version": "1.0.0",
-  "description": "Discord Roblox game monitor bot with player count, uptime, buttons, and auto-rotation.",
-  "main": "index.js",
+  "description": "Open Cloud publisher that updates games.json before starting your existing Discord monitor bot.",
+  "main": "publish-and-start.js",
   "scripts": {
-    "start": "node index.js"
+    "start": "node publish-and-start.js",
+    "publish": "node publisher.js",
+    "discord": "node index.js"
   },
   "dependencies": {
     "axios": "^1.7.9",
-    "discord.js": "^14.16.3",
-    "dotenv": "^16.4.7"
+    "dotenv": "^16.4.7",
+    "form-data": "^4.0.1",
+    "discord.js": "^14.16.3"
   }
 }
